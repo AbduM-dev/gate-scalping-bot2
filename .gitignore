@@ -1,0 +1,23 @@
+# Secrets — NEVER push
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+trades_log.csv
+*.log
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# OS files
+.DS_Store
+Thumbs.db
