@@ -612,8 +612,12 @@ async def main():
 ╚══════════════════════════════════════════╝
     """)
 
-    if not API_KEY:
-        print("[ERROR] GATE_API_KEY missing in .env")
+    if not API_KEY or not API_SECRET:
+        print(f"[ERROR] Missing credentials!")
+        print(f"  - GATE_API_KEY: {'✅ FOUND' if API_KEY else '❌ MISSING'}")
+        print(f"  - GATE_API_SECRET: {'✅ FOUND' if API_SECRET else '❌ MISSING'}")
+        print("\nAvailable Environment Variables (Names only):")
+        print(", ".join(os.environ.keys()))
         return
 
     # FIX: sync positions عند البدء
