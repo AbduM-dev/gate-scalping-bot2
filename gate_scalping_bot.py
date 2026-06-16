@@ -1,13 +1,10 @@
 """
-Gate.io HFT Scalping Bot — v7.1 (Bug Fixed)
-الإصلاحات:
-  1. hmac import على مستوى الملف + signature format صح
-  2. asyncio tasks محفوظة → مش بتتمسح من الميموري
-  3. WebSocket: extra_headers + ping_timeout + ssl صريح
-  4. current_open parameter اتحذف (كان unused)
-  5. process_position_update: logging صح من غير settings_dummy
-  6. _make_ws_auth: timestamp fresh في كل call
-  7. 502 error: رسالة واضحة + تشيك URL
+Gate.io HFT Scalping Bot — v7.2 (Final Comprehensive Fix)
+الإصلاحات النهائية:
+  1. typing imports → Python 3.8+ compatible
+  2. asyncio.Lock lazy init → مش بيتعمل قبل event loop
+  3. create_price_triggered_order → SDK objects مش dict
+  4. list_futures_positions → اسم الـ method الصح
 """
 
 import asyncio
@@ -21,10 +18,14 @@ import hashlib
 from datetime import datetime
 from collections import deque
 from statistics import mean, stdev
+from typing import Dict, Optional
 from dotenv import load_dotenv
 
 import websockets
-from gate_api import ApiClient, Configuration, FuturesApi, FuturesOrder
+from gate_api import (
+    ApiClient, Configuration, FuturesApi, FuturesOrder,
+    FuturePriceTriggeredOrder, FutureInitialOrder, FuturePriceTrigger,
+)
 
 load_dotenv()
 
@@ -97,12 +98,11 @@ ZSCORE_WINDOW_SEC    = 90
 ZSCORE_TRIGGER       = 2.5
 
 # ─────────────────────────────────────────────
-#  FIX 2: Task registry — منع GC للـ tasks
+#  Task registry — منع GC للـ tasks
 # ─────────────────────────────────────────────
 _running_tasks: set = set()
 
 def create_task(coro):
-    """asyncio.create_task مع حفظ الـ reference"""
     task = asyncio.create_task(coro)
     _running_tasks.add(task)
     task.add_done_callback(_running_tasks.discard)
@@ -112,7 +112,6 @@ def create_task(coro):
 #  💡  DYNAMIC SETTINGS
 # ─────────────────────────────────────────────
 def get_bot_settings(symbol: str, available_balance: float) -> dict:
-    # FIX 4: حذف current_open parameter (كان unused)
     profile = ASSET_PROFILES.get(symbol, {"max_leverage": 10, "contract_size": 1})
     max_lev = profile["max_leverage"]
 
@@ -133,14 +132,8 @@ def get_bot_settings(symbol: str, available_balance: float) -> dict:
         trailing_activation = 0.003
         trailing_callback   = 0.002
 
-    if leverage >= 100:
-        buffer = 0.001
-    elif leverage >= 50:
-        buffer = 0.002
-    else:
-        buffer = 0.003
-
-    sl_pct          = (0.40 / leverage) + buffer
+    buffer = 0.001 if leverage >= 100 else (0.002 if leverage >= 50 else 0.003)
+    sl_pct = (0.40 / leverage) + buffer
     position_margin = (available_balance * 0.20) / MAX_OPEN_POSITIONS
 
     return {
@@ -154,6 +147,7 @@ def get_bot_settings(symbol: str, available_balance: float) -> dict:
 
 # ─────────────────────────────────────────────
 #  📦  STATE
+#  FIX 2: asyncio.Lock lazy init — مش بيتعمل قبل event loop
 # ─────────────────────────────────────────────
 class SymbolState:
     def __init__(self, symbol: str):
@@ -161,16 +155,24 @@ class SymbolState:
         self.trades_buffer    = deque()
         self.price_buffer     = deque()
         self.open_position    = False
-        self.entry_lock       = asyncio.Lock()
+        self._entry_lock: Optional[asyncio.Lock] = None  # lazy
         self.last_sl_time     = 0.0
         self.last_signal_time = 0.0
         self.entry_price      = 0.0
         self.position_size    = 0
         self.current_price    = 0.0
         self.volume_24h       = 0.0
-        self.entry_settings   = {}    # FIX 5: حفظ settings وقت الدخول للـ logging
+        self.entry_settings: dict = {}
 
-states: dict[str, SymbolState] = {s: SymbolState(s) for s in ALL_SYMBOLS}
+    @property
+    def entry_lock(self) -> asyncio.Lock:
+        # بيتعمل أول ما يتطلب — ضمن الـ event loop
+        if self._entry_lock is None:
+            self._entry_lock = asyncio.Lock()
+        return self._entry_lock
+
+# FIX 1: Dict من typing → Python 3.8+
+states: Dict[str, SymbolState] = {s: SymbolState(s) for s in ALL_SYMBOLS}
 
 daily_trades   = 0
 last_reset_day = ""
@@ -259,10 +261,11 @@ def set_leverage(symbol: str, leverage: int):
     except Exception as e:
         print(f"[{symbol}] LEVERAGE ERROR: {e}")
 
+# FIX 4: list_futures_positions → الاسم الصح
 def sync_open_positions():
     try:
         api       = get_futures_api()
-        positions = api.list_positions(settle=SETTLE)
+        positions = api.list_futures_positions(settle=SETTLE)
         for pos in positions:
             symbol = pos.contract
             size   = float(pos.size or 0)
@@ -288,7 +291,7 @@ async def execute_entry(st: SymbolState):
             return
 
         balance  = get_balance()
-        settings = get_bot_settings(st.symbol, balance)  # FIX 4
+        settings = get_bot_settings(st.symbol, balance)
 
         if settings["position_margin"] < 1.0:
             print(f"[{st.symbol}] Margin too small: ${settings['position_margin']:.2f}")
@@ -318,7 +321,7 @@ async def execute_entry(st: SymbolState):
             st.open_position  = True
             st.entry_price    = fill_price
             st.position_size  = contracts
-            st.entry_settings = settings    # FIX 5: حفظ settings
+            st.entry_settings = settings
             daily_trades     += 1
 
             print(f"[{st.symbol}] ✅ FILLED @ {fill_price}")
@@ -351,31 +354,35 @@ async def emergency_close(st: SymbolState, contracts: int):
 
 # ─────────────────────────────────────────────
 #  🔒  BRACKET ORDERS
+#  FIX 3: create_price_triggered_order → SDK objects مش dict
 # ─────────────────────────────────────────────
 async def place_bracket(st: SymbolState, entry: float, contracts: int, settings: dict) -> bool:
     api              = get_futures_api()
     sl_price         = round(entry * (1 - settings["sl_pct"]), 6)
     activation_price = round(entry * (1 + settings["trailing_activation"]), 6)
     callback_rate    = settings["trailing_callback"]
+
     print(f"[{st.symbol}] Bracket | SL={sl_price} | TrailAt={activation_price} | CB={callback_rate*100:.1f}%")
     sl_placed = False
+
+    # ── Stop Loss ──
     try:
-        sl_order = {
-            "initial": {
-                "contract":   st.symbol,
-                "size":       -contracts,
-                "price":      "0",
-                "tif":        "ioc",
-                "reduce_only": True,
-                "text":       "t-sl",
-            },
-            "trigger": {
-                "strategy_type": 0,
-                "price_type":    1,
-                "price":         str(sl_price),
-                "rule":          2,
-            }
-        }
+        sl_order = FuturePriceTriggeredOrder(
+            initial=FutureInitialOrder(
+                contract   = st.symbol,
+                size       = -contracts,
+                price      = "0",
+                tif        = "ioc",
+                reduce_only= True,
+                text       = "t-sl",
+            ),
+            trigger=FuturePriceTrigger(
+                strategy_type = 0,   # by price
+                price_type    = 1,   # mark price
+                price         = str(sl_price),
+                rule          = 2,   # price <= trigger (LONG SL)
+            )
+        )
         api.create_price_triggered_order(
             settle=SETTLE, future_price_triggered_order=sl_order
         )
@@ -383,33 +390,36 @@ async def place_bracket(st: SymbolState, entry: float, contracts: int, settings:
         sl_placed = True
     except Exception as e:
         print(f"[{st.symbol}] ❌ SL FAILED: {e}")
-    # Trailing Stop
+
+    # ── Trailing Stop ──
     try:
-        trail_order = {
-            "initial": {
-                "contract":    st.symbol,
-                "size":        -contracts,
-                "price":       "0",
-                "tif":         "ioc",
-                "reduce_only": True,
-                "text":        "t-trail",
-            },
-            "trigger": {
-                "strategy_type": 1,
-                "price_type":    1,
-                "price":         str(activation_price),
-                "rule":          1,
-                "callback_rate": str(callback_rate),
-            }
-        }
+        trail_order = FuturePriceTriggeredOrder(
+            initial=FutureInitialOrder(
+                contract   = st.symbol,
+                size       = -contracts,
+                price      = "0",
+                tif        = "ioc",
+                reduce_only= True,
+                text       = "t-trail",
+            ),
+            trigger=FuturePriceTrigger(
+                strategy_type = 1,                  # trailing
+                price_type    = 1,                  # mark price
+                price         = str(activation_price),
+                rule          = 1,                  # price >= activation
+                callback_rate = str(callback_rate),
+            )
+        )
         api.create_price_triggered_order(
             settle=SETTLE, future_price_triggered_order=trail_order
         )
         print(f"[{st.symbol}] ✅ Trail @ {activation_price}")
     except Exception as e:
         print(f"[{st.symbol}] ⚠️ Trail FAILED: {e}")
+
     log_trade(st.symbol, entry, sl_price, activation_price, settings)
     return sl_placed
+
 # ─────────────────────────────────────────────
 #  📝  LOGGING
 # ─────────────────────────────────────────────
@@ -428,6 +438,7 @@ def log_trade(symbol, entry, sl, activation, settings,
             entry, sl, activation,
             exit_price or "", pnl or "", reason or "open"
         ])
+
 # ─────────────────────────────────────────────
 #  🌐  PROCESS EVENTS
 # ─────────────────────────────────────────────
@@ -451,6 +462,7 @@ def process_trade_event(symbol: str, trade: dict):
         st.trades_buffer.popleft()
     while st.price_buffer and st.price_buffer[0][0] < cutoff_p:
         st.price_buffer.popleft()
+
 def process_position_update(pos: dict):
     symbol = pos.get("contract", "")
     size   = float(pos.get("size", 0))
@@ -463,8 +475,7 @@ def process_position_update(pos: dict):
         print(f"[{symbol}] 🔴 Closed | PnL={realised_pnl:.4f} USDT")
         if realised_pnl < 0:
             st.last_sl_time = time.time()
-            print(f"[{symbol}] ⏳ SL Cooldown {COOLDOWN_AFTER_SL}s")
-        # FIX 5: استخدم الـ settings المحفوظة وقت الدخول
+            print(f"[{symbol}] ⏳ Cooldown {COOLDOWN_AFTER_SL}s")
         log_trade(
             symbol, st.entry_price, 0, 0,
             st.entry_settings or {"leverage": 0, "position_margin": 0},
@@ -476,6 +487,7 @@ def process_position_update(pos: dict):
         st.entry_price    = 0.0
         st.position_size  = 0
         st.entry_settings = {}
+
 # ─────────────────────────────────────────────
 #  📊  VOLUME UPDATER
 # ─────────────────────────────────────────────
@@ -495,11 +507,10 @@ async def update_volumes():
         await asyncio.sleep(3600)
 
 # ─────────────────────────────────────────────
-#  FIX 1: WS Auth — signature format صح
+#  🔐  WS AUTH
 # ─────────────────────────────────────────────
 def make_ws_auth(channel: str, event: str) -> dict:
     ts      = int(time.time())
-    # Gate.io v4 WebSocket signature format
     message = f"channel={channel}\nevent={event}\ntime={ts}"
     sig     = hmac.new(
         API_SECRET.encode("utf-8"),
@@ -514,27 +525,23 @@ def make_ws_auth(channel: str, event: str) -> dict:
     }
 
 # ─────────────────────────────────────────────
-#  FIX 3: WebSocket — headers + ssl + timeout
+#  🔌  WEBSOCKET
 # ─────────────────────────────────────────────
 async def connect_websocket():
-    backoff    = 1
-    ssl_ctx    = ssl.create_default_context()   # FIX 3a: SSL صريح
+    backoff = 1
+    ssl_ctx = ssl.create_default_context()
 
     while True:
         try:
             print(f"[WS] Connecting → {WSS_URL}")
             async with websockets.connect(
                 WSS_URL,
-                ssl            = ssl_ctx,
-                ping_interval  = 20,
-                ping_timeout   = 30,             # FIX 3b: timeout
-                extra_headers  = {               # FIX 3c: User-Agent
-                    "User-Agent": "Mozilla/5.0 (compatible; GateBot/1.0)"
-                }
+                ssl          = ssl_ctx,
+                ping_interval= 20,
+                ping_timeout = 30,
             ) as ws:
                 backoff = 1
 
-                # Subscribe: trades (public — لا يحتاج auth)
                 await ws.send(json.dumps({
                     "time":    int(time.time()),
                     "channel": "futures.trades",
@@ -542,7 +549,6 @@ async def connect_websocket():
                     "payload": ALL_SYMBOLS,
                 }))
 
-                # Subscribe: positions (private — يحتاج auth)
                 await ws.send(json.dumps({
                     "time":    int(time.time()),
                     "channel": "futures.positions",
@@ -569,7 +575,7 @@ async def connect_websocket():
                                 st = states[symbol]
                                 if risk_check(st) and calculate_signals(st):
                                     print(f"[🚀 SIGNAL] {symbol}")
-                                    create_task(execute_entry(st))  # FIX 2
+                                    create_task(execute_entry(st))
 
                     elif channel == "futures.positions" and ev_type == "update":
                         results = event.get("result", [])
@@ -579,16 +585,11 @@ async def connect_websocket():
                             process_position_update(pos)
 
         except websockets.exceptions.ConnectionClosed as e:
-            # FIX 7: رسالة واضحة لـ 502
             code = getattr(e, "code", None)
             if code == 502:
-                print(f"[WS] ❌ 502 Bad Gateway — possible causes:")
-                print(f"       1. Testnet down → check https://status.gate.io")
-                print(f"       2. Wrong API key → must be from testnet.gate.io")
-                print(f"       3. IP blocked by Gate.io")
+                print("[WS] ❌ 502 — testnet down أو API key غلط أو IP محجوب")
             else:
                 print(f"[WS] Closed ({code}) — retry in {backoff}s")
-
         except Exception as e:
             print(f"[WS] Error: {e} — retry in {backoff}s")
 
@@ -602,7 +603,7 @@ async def main():
     mode = "🧪 TESTNET" if TESTNET_MODE else "🔴 LIVE"
     print(f"""
 ╔══════════════════════════════════════════╗
-║   Gate.io HFT Scalping Bot v7.1          ║
+║   Gate.io HFT Scalping Bot v7.2          ║
 ║   Mode    : {mode:<30}║
 ║   Symbols : {len(ALL_SYMBOLS):<30}║
 ║   Max Pos : {MAX_OPEN_POSITIONS:<30}║
@@ -619,7 +620,7 @@ async def main():
     print("[STARTUP] Syncing open positions...")
     sync_open_positions()
 
-    create_task(update_volumes())   # FIX 2
+    create_task(update_volumes())
     await connect_websocket()
 
 if __name__ == "__main__":
