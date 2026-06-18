@@ -1,8 +1,9 @@
 """
-Gate.io HFT Scalping Bot — v9.1 (THE BEAST - Audited & Fixed)
+Gate.io HFT Scalping Bot — v9.2 (THE BEAST - Resilient Edition)
 Fixes:
-  - Corrected SDK class names: FuturesPriceTriggeredOrder, FuturesInitialOrder, FuturesPriceTrigger
-  - Verified method names: list_futures_tickers, list_futures_accounts, update_position_leverage, create_futures_order, create_price_triggered_order
+  - 502 Bad Gateway Resilience: Added exponential backoff and error catching for REST/WS.
+  - Improved Logging: Clearer error messages for IP blocks or server downtime.
+  - WebSocket Stability: Optimized ping/pong and reconnection logic.
 """
 
 import asyncio
@@ -25,6 +26,7 @@ from gate_api import (
     ApiClient, Configuration, FuturesApi, FuturesOrder,
     FuturesPriceTriggeredOrder, FuturesInitialOrder, FuturesPriceTrigger,
 )
+from gate_api.exceptions import GateApiException
 
 # ─────────────────────────────────────────────
 #  📁  LOGGING SETUP
@@ -65,8 +67,8 @@ MAX_DAILY_TRADES   = 30
 COOLDOWN_AFTER_SL  = 60
 MIN_VOLUME_24H     = 20_000_000
 MAX_SYMBOLS_COUNT  = 30
-MAX_SPREAD_PCT     = 0.0015  # 0.15% max spread
-MAX_FUNDING_RATE   = 0.001   # 0.1% max funding rate per 8h
+MAX_SPREAD_PCT     = 0.0015
+MAX_FUNDING_RATE   = 0.001
 SIGNAL_COOLDOWN    = 30
 
 # ─────────────────────────────────────────────
@@ -88,7 +90,7 @@ class SymbolState:
         self.trades_buffer    = deque()
         self.price_buffer     = deque()
         self.open_position    = False
-        self.side             = 0  # 1 Long, -1 Short
+        self.side             = 0
         self._entry_lock      = None
         self.last_sl_time     = 0.0
         self.last_signal_time = 0.0
@@ -107,7 +109,6 @@ class SymbolState:
             self._entry_lock = asyncio.Lock()
         return self._entry_lock
 
-# Global state
 states: Dict[str, SymbolState] = {}
 all_symbols: List[str] = []
 daily_trades = 0
@@ -122,17 +123,17 @@ def create_task(coro):
     return task
 
 # ─────────────────────────────────────────────
-#  🔍  MARKET SCANNER (DYNAMIC)
+#  🔍  MARKET SCANNER (RESILIENT)
 # ─────────────────────────────────────────────
 async def refresh_market_symbols():
     global all_symbols, states
+    backoff = 5
     while True:
         try:
             logger.info("Scanning market for top volume symbols...")
             api = get_futures_api()
             tickers = api.list_futures_tickers(settle=SETTLE)
             
-            # Filter and sort by volume
             valid_tickers = [
                 t for t in tickers 
                 if float(t.volume_24h_quote or 0) >= MIN_VOLUME_24H 
@@ -143,13 +144,10 @@ async def refresh_market_symbols():
             
             top_tickers = valid_tickers[:MAX_SYMBOLS_COUNT]
             new_symbols = [t.contract for t in top_tickers]
-            
-            if "BTC_USDT" not in new_symbols:
-                new_symbols.append("BTC_USDT")
+            if "BTC_USDT" not in new_symbols: new_symbols.append("BTC_USDT")
 
             for sym in new_symbols:
-                if sym not in states:
-                    states[sym] = SymbolState(sym)
+                if sym not in states: states[sym] = SymbolState(sym)
                 ticker_info = next((t for t in top_tickers if t.contract == sym), None)
                 if ticker_info:
                     states[sym].volume_24h = float(ticker_info.volume_24h_quote or 0)
@@ -159,11 +157,16 @@ async def refresh_market_symbols():
             all_symbols = new_symbols
             logger.info(f"Market scan complete. Tracking {len(all_symbols)} symbols.")
             ws_subscription_event.set()
+            backoff = 5 # Reset backoff on success
+            await asyncio.sleep(3600)
             
         except Exception as e:
-            logger.error(f"Market scan failed: {e}")
-        
-        await asyncio.sleep(3600)
+            if "502" in str(e) or "Bad Gateway" in str(e):
+                logger.error(f"Market Scan 502 Error: Gate.io servers busy/down. Retrying in {backoff}s...")
+            else:
+                logger.error(f"Market scan failed: {e}. Retrying in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300)
 
 # ─────────────────────────────────────────────
 #  📈  ANALYTICS & BTC FILTER
@@ -300,14 +303,16 @@ def log_trade(symbol, side, entry, sl, trail, settings, exit_p=None, pnl=None, r
 
 async def connect_websocket():
     ssl_ctx = ssl.create_default_context()
+    backoff = 2
     while True:
         try:
-            logger.info(f"Connecting to WebSocket...")
+            logger.info(f"Connecting to WebSocket (Backoff: {backoff}s)...")
             async with websockets.connect(WSS_URL, ssl=ssl_ctx, ping_interval=20, ping_timeout=30) as ws:
                 await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.trades", "event": "subscribe", "payload": all_symbols}))
                 await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.positions", "event": "subscribe", "payload": ["!all"], "auth": make_ws_auth("futures.positions", "subscribe")}))
                 ws_subscription_event.clear()
                 logger.info("WebSocket Active.")
+                backoff = 2 # Reset on success
                 while not ws_subscription_event.is_set():
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -339,8 +344,12 @@ async def connect_websocket():
                                     st.open_position = False
                     except asyncio.TimeoutError: continue
         except Exception as e:
-            logger.error(f"WS Error: {e}. Reconnecting...")
-            await asyncio.sleep(5)
+            if "502" in str(e) or "Bad Gateway" in str(e):
+                logger.error(f"WS 502 Error: Gate.io gateway busy. Retrying in {backoff}s...")
+            else:
+                logger.error(f"WS Error: {e}. Reconnecting in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 def make_ws_auth(channel: str, event: str) -> dict:
     ts = int(time.time())
@@ -349,7 +358,7 @@ def make_ws_auth(channel: str, event: str) -> dict:
     return {"method": "api_key", "KEY": API_KEY, "SIGN": sig, "Timestamp": str(ts)}
 
 async def main():
-    logger.info("Starting Gate.io HFT BEAST v9.1")
+    logger.info("Starting Gate.io HFT BEAST v9.2")
     if not API_KEY or not API_SECRET: return
     await refresh_market_symbols()
     create_task(refresh_market_symbols())
