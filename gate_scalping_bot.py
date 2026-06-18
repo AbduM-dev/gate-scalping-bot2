@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 import websockets
 from gate_api import (
     ApiClient, Configuration, FuturesApi, FuturesOrder,
-    FuturePriceTriggeredOrder, FutureInitialOrder, FuturePriceTrigger,
+    FuturesPriceTriggeredOrder, FutureInitialOrder, FuturePriceTrigger,
 )
 
 # ─────────────────────────────────────────────
@@ -332,13 +332,13 @@ async def place_bracket(st: SymbolState, entry: float, contracts: int, side: int
     
     try:
         # SL
-        sl_order = FuturePriceTriggeredOrder(
+        sl_order = FuturesPriceTriggeredOrder(
             initial=FutureInitialOrder(contract=st.symbol, size=close_size, price="0", tif="ioc", reduce_only=True),
             trigger=FuturePriceTrigger(strategy_type=0, price_type=1, price=str(sl_price), rule=2 if side==1 else 1)
         )
         api.create_price_triggered_order(settle=SETTLE, future_price_triggered_order=sl_order)
         # Trail
-        trail_order = FuturePriceTriggeredOrder(
+        trail_order = FuturesPriceTriggeredOrder(
             initial=FutureInitialOrder(contract=st.symbol, size=close_size, price="0", tif="ioc", reduce_only=True),
             trigger=FuturePriceTrigger(strategy_type=1, price_type=1, price=str(act_price), rule=1 if side==1 else 2, callback_rate=str(settings["trailing_callback"]))
         )
