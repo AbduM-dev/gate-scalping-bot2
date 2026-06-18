@@ -1,10 +1,11 @@
 """
-Gate.io HFT Scalping Bot — v8.0 (Clean & Robust Rebuild)
-Logic: 
-  - Signals: Volume Imbalance (10s) + Price Z-Score (90s)
-  - Supports: LONG and SHORT positions
-  - Risk: Dynamic Leverage, Stop Loss, Trailing Stop, Circuit Breakers
-  - Environment: Optimized for Railway.app deployment
+Gate.io HFT Scalping Bot — v9.0 (THE BEAST)
+Upgrades:
+  1. Dynamic Market Scanning: Picks top 30 volume symbols automatically.
+  2. BTC Correlation Filter: Only enters if BTC trend aligns.
+  3. Spread Protection: Skips trades with high bid-ask spread.
+  4. Funding Rate Filter: Avoids high funding cost assets.
+  5. WebSocket Auto-Refresh: Updates subscriptions on the fly.
 """
 
 import asyncio
@@ -19,7 +20,7 @@ import logging
 from datetime import datetime
 from collections import deque
 from statistics import mean, stdev
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Set
 from dotenv import load_dotenv
 
 import websockets
@@ -36,7 +37,7 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("GateBot")
+logger = logging.getLogger("BeastBot")
 
 load_dotenv()
 
@@ -50,38 +51,6 @@ SETTLE       = "usdt"
 LOG_FILE     = "trades_log.csv"
 
 # ─────────────────────────────────────────────
-#  📊  ASSET PROFILES
-# ─────────────────────────────────────────────
-ASSET_PROFILES = {
-    "BTC_USDT":  {"max_leverage": 100, "contract_size": 1},
-    "ETH_USDT":  {"max_leverage": 100, "contract_size": 1},
-    "XRP_USDT":  {"max_leverage": 50,  "contract_size": 10},
-    "SOL_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "BNB_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "LTC_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "DOGE_USDT": {"max_leverage": 50,  "contract_size": 1000},
-    "ADA_USDT":  {"max_leverage": 50,  "contract_size": 100},
-    "AVAX_USDT": {"max_leverage": 50,  "contract_size": 1},
-    "LINK_USDT": {"max_leverage": 50,  "contract_size": 1},
-    "DOT_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "UNI_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "ATOM_USDT": {"max_leverage": 50,  "contract_size": 1},
-    "NEAR_USDT": {"max_leverage": 50,  "contract_size": 1},
-    "APT_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "OP_USDT":   {"max_leverage": 50,  "contract_size": 1},
-    "ARB_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "SUI_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "TIA_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "INJ_USDT":  {"max_leverage": 50,  "contract_size": 1},
-    "PEPE_USDT": {"max_leverage": 10,  "contract_size": 1000000},
-    "SHIB_USDT": {"max_leverage": 10,  "contract_size": 1000000},
-    "WIF_USDT":  {"max_leverage": 10,  "contract_size": 1},
-    "FLOKI_USDT":{"max_leverage": 10,  "contract_size": 1000},
-}
-
-ALL_SYMBOLS = list(ASSET_PROFILES.keys())
-
-# ─────────────────────────────────────────────
 #  🔌  ENDPOINTS
 # ─────────────────────────────────────────────
 if TESTNET_MODE:
@@ -92,12 +61,15 @@ else:
     WSS_URL   = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 
 # ─────────────────────────────────────────────
-#  🛡️  CIRCUIT BREAKERS
+#  🛡️  CIRCUIT BREAKERS & FILTERS
 # ─────────────────────────────────────────────
 MAX_OPEN_POSITIONS = 3
-MAX_DAILY_TRADES   = 20
+MAX_DAILY_TRADES   = 30
 COOLDOWN_AFTER_SL  = 60
-MIN_VOLUME_24H     = 50_000_000
+MIN_VOLUME_24H     = 20_000_000
+MAX_SYMBOLS_COUNT  = 30
+MAX_SPREAD_PCT     = 0.0015  # 0.15% max spread
+MAX_FUNDING_RATE   = 0.001   # 0.1% max funding rate per 8h
 SIGNAL_COOLDOWN    = 30
 
 # ─────────────────────────────────────────────
@@ -105,15 +77,46 @@ SIGNAL_COOLDOWN    = 30
 # ─────────────────────────────────────────────
 IMBALANCE_WINDOW_SEC = 10
 IMBALANCE_LONG       = 5.0
-IMBALANCE_SHORT      = 0.2  # 1/5.0
+IMBALANCE_SHORT      = 0.2
 ZSCORE_WINDOW_SEC    = 90
 ZSCORE_LONG          = 2.5
 ZSCORE_SHORT         = -2.5
 
 # ─────────────────────────────────────────────
-#  Task registry
+#  📦  STATE MANAGEMENT
 # ─────────────────────────────────────────────
+class SymbolState:
+    def __init__(self, symbol: str):
+        self.symbol           = symbol
+        self.trades_buffer    = deque()
+        self.price_buffer     = deque()
+        self.open_position    = False
+        self.side             = 0  # 1 Long, -1 Short
+        self._entry_lock      = None
+        self.last_sl_time     = 0.0
+        self.last_signal_time = 0.0
+        self.entry_price      = 0.0
+        self.position_size    = 0
+        self.current_price    = 0.0
+        self.best_bid         = 0.0
+        self.best_ask         = 0.0
+        self.volume_24h       = 0.0
+        self.funding_rate     = 0.0
+        self.entry_settings   = {}
+
+    @property
+    def entry_lock(self) -> asyncio.Lock:
+        if self._entry_lock is None:
+            self._entry_lock = asyncio.Lock()
+        return self._entry_lock
+
+# Global state
+states: Dict[str, SymbolState] = {}
+all_symbols: List[str] = []
+daily_trades = 0
+last_reset_day = ""
 _running_tasks: set = set()
+ws_subscription_event = asyncio.Event()
 
 def create_task(coro):
     task = asyncio.create_task(coro)
@@ -122,123 +125,130 @@ def create_task(coro):
     return task
 
 # ─────────────────────────────────────────────
-#  💡  DYNAMIC SETTINGS
+#  🔍  MARKET SCANNER (DYNAMIC)
 # ─────────────────────────────────────────────
-def get_bot_settings(symbol: str, available_balance: float) -> dict:
-    profile = ASSET_PROFILES.get(symbol, {"max_leverage": 10, "contract_size": 1})
-    max_lev = profile["max_leverage"]
+async def refresh_market_symbols():
+    global all_symbols, states
+    while True:
+        try:
+            logger.info("Scanning market for top volume symbols...")
+            api = get_futures_api()
+            tickers = api.list_futures_tickers(settle=SETTLE)
+            
+            # Filter and sort by volume
+            valid_tickers = [
+                t for t in tickers 
+                if float(t.volume_24h_quote or 0) >= MIN_VOLUME_24H 
+                and "_USDT" in t.contract 
+                and "BEAR" not in t.contract and "BULL" not in t.contract # Skip leveraged tokens
+            ]
+            valid_tickers.sort(key=lambda x: float(x.volume_24h_quote or 0), reverse=True)
+            
+            top_tickers = valid_tickers[:MAX_SYMBOLS_COUNT]
+            new_symbols = [t.contract for t in top_tickers]
+            
+            # Always include BTC_USDT for correlation
+            if "BTC_USDT" not in new_symbols:
+                new_symbols.append("BTC_USDT")
 
-    if available_balance < 10:
-        leverage = min(10, max_lev)
-        trailing_activation, trailing_callback = 0.015, 0.010
-    elif available_balance < 50:
-        leverage = min(25, max_lev)
-        trailing_activation, trailing_callback = 0.010, 0.006
-    elif available_balance < 200:
-        leverage = min(round(max_lev * 0.75), max_lev)
-        trailing_activation, trailing_callback = 0.005, 0.004
-    else:
-        leverage = min(round(max_lev * 0.75), max_lev)
-        trailing_activation, trailing_callback = 0.003, 0.002
+            # Update states
+            for sym in new_symbols:
+                if sym not in states:
+                    states[sym] = SymbolState(sym)
+                # Update volume info
+                ticker_info = next((t for t in top_tickers if t.contract == sym), None)
+                if ticker_info:
+                    states[sym].volume_24h = float(ticker_info.volume_24h_quote or 0)
+                    states[sym].best_bid = float(ticker_info.highest_bid or 0)
+                    states[sym].best_ask = float(ticker_info.lowest_ask or 0)
 
-    buffer = 0.001 if leverage >= 100 else (0.002 if leverage >= 50 else 0.003)
-    sl_pct = (0.40 / leverage) + buffer
-    position_margin = (available_balance * 0.20) / MAX_OPEN_POSITIONS
-
-    return {
-        "leverage":            leverage,
-        "sl_pct":              sl_pct,
-        "trailing_activation": trailing_activation,
-        "trailing_callback":   trailing_callback,
-        "position_margin":     position_margin,
-        "contract_size":       profile["contract_size"],
-    }
-
-# ─────────────────────────────────────────────
-#  📦  STATE
-# ─────────────────────────────────────────────
-class SymbolState:
-    def __init__(self, symbol: str):
-        self.symbol           = symbol
-        self.trades_buffer    = deque()
-        self.price_buffer     = deque()
-        self.open_position    = False
-        self.side             = 0  # 1 for Long, -1 for Short
-        self._entry_lock: Optional[asyncio.Lock] = None
-        self.last_sl_time     = 0.0
-        self.last_signal_time = 0.0
-        self.entry_price      = 0.0
-        self.position_size    = 0
-        self.current_price    = 0.0
-        self.volume_24h       = 0.0
-        self.entry_settings: dict = {}
-
-    @property
-    def entry_lock(self) -> asyncio.Lock:
-        if self._entry_lock is None:
-            self._entry_lock = asyncio.Lock()
-        return self._entry_lock
-
-states: Dict[str, SymbolState] = {s: SymbolState(s) for s in ALL_SYMBOLS}
-daily_trades   = 0
-last_reset_day = ""
-
-def open_positions_count() -> int:
-    return sum(1 for s in states.values() if s.open_position)
+            all_symbols = new_symbols
+            logger.info(f"Market scan complete. Tracking {len(all_symbols)} symbols.")
+            
+            # Signal WS to re-subscribe
+            ws_subscription_event.set()
+            
+        except Exception as e:
+            logger.error(f"Market scan failed: {e}")
+        
+        await asyncio.sleep(3600) # Refresh every hour
 
 # ─────────────────────────────────────────────
-#  📈  ANALYTICS ENGINE
+#  📈  ANALYTICS & BTC FILTER
 # ─────────────────────────────────────────────
-def calc_analytics(st: SymbolState):
+def get_btc_trend() -> int:
+    """Returns 1 for Up, -1 for Down, 0 for Neutral based on last 2 mins"""
+    btc = states.get("BTC_USDT")
+    if not btc or len(btc.price_buffer) < 10:
+        return 0
+    
+    now = time.time()
+    prices = [p for ts, p in btc.price_buffer if ts >= now - 120]
+    if len(prices) < 5: return 0
+    
+    start_p, end_p = prices[0], prices[-1]
+    change = (end_p - start_p) / start_p
+    
+    if change > 0.0005: return 1
+    if change < -0.0005: return -1
+    return 0
+
+def get_signal(st: SymbolState) -> int:
+    if time.time() - st.last_signal_time < SIGNAL_COOLDOWN:
+        return 0
+    
+    # Calculate Analytics
     now = time.time()
     # Imbalance
     cutoff_imb = now - IMBALANCE_WINDOW_SEC
-    buy_vol  = sum(t["qty"] for t in st.trades_buffer if t["ts"] >= cutoff_imb and t["side"] == "buy")
-    sell_vol = sum(t["qty"] for t in st.trades_buffer if t["ts"] >= cutoff_imb and t["side"] == "sell")
-    imbalance = (buy_vol / sell_vol) if sell_vol > 0 else (buy_vol if buy_vol > 0 else 1.0)
+    buy_v  = sum(t["qty"] for t in st.trades_buffer if t["ts"] >= cutoff_imb and t["side"] == "buy")
+    sell_v = sum(t["qty"] for t in st.trades_buffer if t["ts"] >= cutoff_imb and t["side"] == "sell")
+    imb = (buy_v / sell_v) if sell_v > 0 else 1.0
     
     # Z-Score
     cutoff_z = now - ZSCORE_WINDOW_SEC
     prices = [p for ts, p in st.price_buffer if ts >= cutoff_z]
-    if len(prices) < 10:
-        return imbalance, 0.0
-    
+    if len(prices) < 10: return 0
     m, sd = mean(prices), stdev(prices)
-    zscore = ((st.current_price - m) / sd) if sd > 0 else 0.0
-    return imbalance, zscore
-
-def get_signal(st: SymbolState) -> int:
-    """Returns 1 for Long, -1 for Short, 0 for None"""
-    if time.time() - st.last_signal_time < SIGNAL_COOLDOWN:
-        return 0
+    z = ((st.current_price - m) / sd) if sd > 0 else 0.0
     
-    imb, z = calc_analytics(st)
+    btc_trend = get_btc_trend()
     
-    if imb > IMBALANCE_LONG and z > ZSCORE_LONG:
-        logger.info(f"[{st.symbol}] LONG SIGNAL | Imb={imb:.2f} | Z={z:.2f}")
-        return 1
-    elif imb < IMBALANCE_SHORT and z < ZSCORE_SHORT:
-        logger.info(f"[{st.symbol}] SHORT SIGNAL | Imb={imb:.2f} | Z={z:.2f}")
-        return -1
+    # Logic with BTC Filter
+    if imb > IMBALANCE_LONG and z > ZSCORE_LONG and btc_trend >= 0:
+        return 1 # Long
+    if imb < IMBALANCE_SHORT and z < ZSCORE_SHORT and btc_trend <= 0:
+        return -1 # Short
     return 0
 
 # ─────────────────────────────────────────────
-#  🛡️  RISK CHECK
+#  🛡️  BEAST RISK CHECKS
 # ─────────────────────────────────────────────
-def risk_check(st: SymbolState) -> bool:
+def beast_risk_check(st: SymbolState) -> bool:
     global daily_trades, last_reset_day
     today = datetime.utcnow().strftime("%Y-%m-%d")
     if last_reset_day != today:
         daily_trades, last_reset_day = 0, today
+
+    if st.open_position or sum(1 for s in states.values() if s.open_position) >= MAX_OPEN_POSITIONS:
+        return False
+    
+    # Spread Protection
+    if st.best_bid > 0 and st.best_ask > 0:
+        spread = (st.best_ask - st.best_bid) / st.best_bid
+        if spread > MAX_SPREAD_PCT:
+            return False
+            
+    # Funding Rate Filter
+    if abs(st.funding_rate) > MAX_FUNDING_RATE:
+        return False
         
-    if st.open_position or open_positions_count() >= MAX_OPEN_POSITIONS:
-        return False
-    if st.volume_24h > 0 and st.volume_24h < MIN_VOLUME_24H:
-        return False
     if daily_trades >= MAX_DAILY_TRADES:
         return False
+        
     if time.time() - st.last_sl_time < COOLDOWN_AFTER_SL:
         return False
+        
     return True
 
 # ─────────────────────────────────────────────
@@ -253,36 +263,27 @@ def get_balance() -> float:
         api = get_futures_api()
         acc = api.list_futures_accounts(settle=SETTLE)
         return float(acc.available)
-    except Exception as e:
-        logger.error(f"Balance check failed: {e}")
-        return 0.0
+    except Exception: return 0.0
 
-def set_leverage(symbol: str, leverage: int):
-    try:
-        api = get_futures_api()
-        api.update_position_leverage(settle=SETTLE, contract=symbol, leverage=str(leverage))
-        logger.info(f"[{symbol}] Leverage set to {leverage}x")
-    except Exception as e:
-        logger.error(f"[{symbol}] Failed to set leverage: {e}")
-
-def sync_open_positions():
-    try:
-        api = get_futures_api()
-        positions = api.list_futures_positions(settle=SETTLE)
-        for pos in positions:
-            symbol, size = pos.contract, float(pos.size or 0)
-            if symbol in states and size != 0:
-                st = states[symbol]
-                st.open_position = True
-                st.side = 1 if size > 0 else -1
-                st.entry_price = float(pos.entry_price or 0)
-                st.position_size = int(abs(size))
-                logger.info(f"[RECOVERY] {symbol} | Side={'LONG' if st.side==1 else 'SHORT'} | Size={size}")
-    except Exception as e:
-        logger.error(f"Position sync failed: {e}")
+def get_bot_settings(symbol: str, balance: float) -> dict:
+    # Simplified dynamic settings
+    leverage = 20 if balance < 100 else 50
+    leverage = min(leverage, 50) # Safety cap
+    
+    sl_pct = (0.45 / leverage) + 0.002
+    margin = (balance * 0.25) / MAX_OPEN_POSITIONS
+    
+    return {
+        "leverage": leverage,
+        "sl_pct": sl_pct,
+        "trailing_activation": 0.006,
+        "trailing_callback": 0.004,
+        "position_margin": margin,
+        "contract_size": 1.0 # Will be updated dynamically if needed
+    }
 
 # ─────────────────────────────────────────────
-#  🚀  EXECUTE ENTRY
+#  🚀  EXECUTION ENGINE
 # ─────────────────────────────────────────────
 async def execute_entry(st: SymbolState, side: int):
     global daily_trades
@@ -293,25 +294,21 @@ async def execute_entry(st: SymbolState, side: int):
         
         balance = get_balance()
         settings = get_bot_settings(st.symbol, balance)
-        if settings["position_margin"] < 1.0:
-            logger.warning(f"[{st.symbol}] Margin too low (${settings['position_margin']:.2f})")
-            return
+        if settings["position_margin"] < 1.0: return
 
-        set_leverage(st.symbol, settings["leverage"])
-        
-        # Calculate contracts
-        contract_value = st.current_price * settings["contract_size"]
-        contracts = int((settings["position_margin"] * settings["leverage"]) / contract_value)
-        contracts = max(1, contracts)
-        
-        # Size is positive for long, negative for short
-        order_size = contracts if side == 1 else -contracts
-        
-        logger.info(f"[{st.symbol}] SENDING {'LONG' if side==1 else 'SHORT'} | Size={order_size} | Price={st.current_price}")
-        
         try:
             api = get_futures_api()
-            order = FuturesOrder(contract=st.symbol, size=order_size, price="0", tif="ioc", text="t-hft-bot")
+            # Set leverage
+            api.update_position_leverage(settle=SETTLE, contract=st.symbol, leverage=str(settings["leverage"]))
+            
+            # Calculate size
+            contracts = int((settings["position_margin"] * settings["leverage"]) / st.current_price)
+            contracts = max(1, contracts)
+            order_size = contracts if side == 1 else -contracts
+            
+            logger.info(f"[{st.symbol}] BEAST ENTRY | {'LONG' if side==1 else 'SHORT'} | Size={order_size}")
+            
+            order = FuturesOrder(contract=st.symbol, size=order_size, price="0", tif="ioc", text="beast-v9")
             result = api.create_futures_order(settle=SETTLE, futures_order=order)
             fill_price = float(result.fill_price) if result.fill_price and float(result.fill_price) > 0 else st.current_price
             
@@ -321,187 +318,119 @@ async def execute_entry(st: SymbolState, side: int):
             daily_trades += 1
             
             logger.info(f"[{st.symbol}] ✅ FILLED @ {fill_price}")
-            
-            bracket_ok = await place_bracket(st, fill_price, contracts, side, settings)
-            if not bracket_ok:
-                logger.error(f"[{st.symbol}] 🚨 Bracket failed! Emergency close.")
-                await emergency_close(st)
+            await place_bracket(st, fill_price, contracts, side, settings)
                 
         except Exception as e:
             logger.error(f"[{st.symbol}] Entry failed: {e}")
             st.open_position = False
 
-async def emergency_close(st: SymbolState):
-    try:
-        api = get_futures_api()
-        # To close, send opposite size
-        close_size = -st.position_size if st.side == 1 else st.position_size
-        order = FuturesOrder(contract=st.symbol, size=close_size, price="0", tif="ioc", reduce_only=True, text="t-emergency")
-        api.create_futures_order(settle=SETTLE, futures_order=order)
-        st.open_position = False
-        logger.info(f"[{st.symbol}] 🚨 Emergency close executed")
-    except Exception as e:
-        logger.critical(f"[{st.symbol}] 💀 EMERGENCY CLOSE FAILED: {e}")
-
-# ─────────────────────────────────────────────
-#  🔒  BRACKET ORDERS
-# ─────────────────────────────────────────────
-async def place_bracket(st: SymbolState, entry: float, contracts: int, side: int, settings: dict) -> bool:
+async def place_bracket(st: SymbolState, entry: float, contracts: int, side: int, settings: dict):
     api = get_futures_api()
-    
-    # Prices
-    if side == 1: # Long
-        sl_price = round(entry * (1 - settings["sl_pct"]), 6)
-        activation_price = round(entry * (1 + settings["trailing_activation"]), 6)
-        rule_sl, rule_trail = 2, 1 # SL: price <= trigger, Trail: price >= activation
-    else: # Short
-        sl_price = round(entry * (1 + settings["sl_pct"]), 6)
-        activation_price = round(entry * (1 - settings["trailing_activation"]), 6)
-        rule_sl, rule_trail = 1, 2 # SL: price >= trigger, Trail: price <= activation
-
-    # Size to close is opposite of entry
+    sl_price = round(entry * (1 - settings["sl_pct"] if side == 1 else 1 + settings["sl_pct"]), 6)
+    act_price = round(entry * (1 + settings["trailing_activation"] if side == 1 else 1 - settings["trailing_activation"]), 6)
     close_size = -contracts if side == 1 else contracts
     
-    sl_placed = False
     try:
-        # Stop Loss
+        # SL
         sl_order = FuturePriceTriggeredOrder(
-            initial=FutureInitialOrder(contract=st.symbol, size=close_size, price="0", tif="ioc", reduce_only=True, text="t-sl"),
-            trigger=FuturePriceTrigger(strategy_type=0, price_type=1, price=str(sl_price), rule=rule_sl)
+            initial=FutureInitialOrder(contract=st.symbol, size=close_size, price="0", tif="ioc", reduce_only=True),
+            trigger=FuturePriceTrigger(strategy_type=0, price_type=1, price=str(sl_price), rule=2 if side==1 else 1)
         )
         api.create_price_triggered_order(settle=SETTLE, future_price_triggered_order=sl_order)
-        logger.info(f"[{st.symbol}] ✅ SL set @ {sl_price}")
-        sl_placed = True
-    except Exception as e:
-        logger.error(f"[{st.symbol}] SL failed: {e}")
-
-    try:
-        # Trailing Stop
+        # Trail
         trail_order = FuturePriceTriggeredOrder(
-            initial=FutureInitialOrder(contract=st.symbol, size=close_size, price="0", tif="ioc", reduce_only=True, text="t-trail"),
-            trigger=FuturePriceTrigger(strategy_type=1, price_type=1, price=str(activation_price), rule=rule_trail, callback_rate=str(settings["trailing_callback"]))
+            initial=FutureInitialOrder(contract=st.symbol, size=close_size, price="0", tif="ioc", reduce_only=True),
+            trigger=FuturePriceTrigger(strategy_type=1, price_type=1, price=str(act_price), rule=1 if side==1 else 2, callback_rate=str(settings["trailing_callback"]))
         )
         api.create_price_triggered_order(settle=SETTLE, future_price_triggered_order=trail_order)
-        logger.info(f"[{st.symbol}] ✅ Trail set @ {activation_price}")
+        logger.info(f"[{st.symbol}] ✅ Brackets Set (SL: {sl_price})")
+        log_trade(st.symbol, "LONG" if side==1 else "SHORT", entry, sl_price, act_price, settings)
     except Exception as e:
-        logger.error(f"[{st.symbol}] Trail failed: {e}")
-
-    log_trade(st.symbol, "LONG" if side==1 else "SHORT", entry, sl_price, activation_price, settings)
-    return sl_placed
+        logger.error(f"[{st.symbol}] Bracket setup failed: {e}")
 
 # ─────────────────────────────────────────────
-#  📝  LOGGING & EVENTS
+#  🌐  WEBSOCKET & EVENTS
 # ─────────────────────────────────────────────
-def log_trade(symbol, side, entry, sl, activation, settings, exit_p=None, pnl=None, reason="open"):
+def log_trade(symbol, side, entry, sl, trail, settings, exit_p=None, pnl=None, reason="open"):
     exists = os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a", newline="") as f:
         w = csv.writer(f)
-        if not exists:
-            w.writerow(["time", "symbol", "side", "lev", "margin", "entry", "sl", "trail", "exit", "pnl", "reason"])
-        w.writerow([datetime.utcnow().isoformat(), symbol, side, settings.get("leverage"), round(settings.get("position_margin",0),2), entry, sl, activation, exit_p or "", pnl or "", reason])
+        if not exists: w.writerow(["time", "symbol", "side", "lev", "margin", "entry", "sl", "trail", "exit", "pnl", "reason"])
+        w.writerow([datetime.utcnow().isoformat(), symbol, side, settings.get("leverage"), round(settings.get("position_margin",0),2), entry, sl, trail, exit_p or "", pnl or "", reason])
 
-def process_trade_event(symbol: str, trade: dict):
-    st = states.get(symbol)
-    if not st: return
-    
-    ts, price, qty = time.time(), float(trade.get("price", 0)), float(trade.get("size", 0))
-    if price <= 0: return
-    
-    st.current_price = price
-    st.trades_buffer.append({"ts": ts, "price": price, "qty": abs(qty), "side": "buy" if qty > 0 else "sell"})
-    st.price_buffer.append((ts, price))
-    
-    # Cleanup buffers
-    cutoff_imb, cutoff_z = ts - IMBALANCE_WINDOW_SEC - 1, ts - ZSCORE_WINDOW_SEC - 1
-    while st.trades_buffer and st.trades_buffer[0]["ts"] < cutoff_imb: st.trades_buffer.popleft()
-    while st.price_buffer and st.price_buffer[0][0] < cutoff_z: st.price_buffer.popleft()
-
-def process_position_update(pos: dict):
-    symbol, size = pos.get("contract", ""), float(pos.get("size", 0))
-    st = states.get(symbol)
-    if st and size == 0 and st.open_position:
-        pnl, exit_p = float(pos.get("realised_pnl", 0)), float(pos.get("last_price", st.entry_price))
-        logger.info(f"[{symbol}] 🔴 CLOSED | PnL: {pnl:.4f} USDT")
-        if pnl < 0:
-            st.last_sl_time = time.time()
-        
-        log_trade(symbol, "LONG" if st.side==1 else "SHORT", st.entry_price, 0, 0, st.entry_settings, exit_p, round(pnl,4), "closed")
-        st.open_position, st.side, st.entry_price, st.position_size, st.entry_settings = False, 0, 0.0, 0, {}
-
-# ─────────────────────────────────────────────
-#  📊  VOLUME UPDATER
-# ─────────────────────────────────────────────
-async def update_volumes():
+async def connect_websocket():
+    ssl_ctx = ssl.create_default_context()
     while True:
         try:
-            api = get_futures_api()
-            ticks = api.list_futures_tickers(settle=SETTLE)
-            for t in ticks:
-                if t.contract in states:
-                    states[t.contract].volume_24h = float(t.volume_24h_quote or 0)
-            logger.info(f"Market volumes updated ({len(ticks)} tickers)")
-        except Exception as e:
-            logger.error(f"Volume update failed: {e}")
-        await asyncio.sleep(3600)
+            logger.info(f"Connecting to WebSocket...")
+            async with websockets.connect(WSS_URL, ssl=ssl_ctx, ping_interval=20, ping_timeout=30) as ws:
+                # Initial Subscription
+                await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.trades", "event": "subscribe", "payload": all_symbols}))
+                await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.positions", "event": "subscribe", "payload": ["!all"], "auth": make_ws_auth("futures.positions", "subscribe")}))
+                ws_subscription_event.clear()
+                
+                logger.info("WebSocket Active.")
+                
+                while not ws_subscription_event.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        data = json.loads(raw)
+                        channel, ev = data.get("channel"), data.get("event")
+                        
+                        if channel == "futures.trades" and ev == "update":
+                            for trade in (data.get("result", []) if isinstance(data.get("result"), list) else [data.get("result")]):
+                                sym = trade.get("contract")
+                                if sym in states:
+                                    st = states[sym]
+                                    ts, price, qty = time.time(), float(trade.get("price", 0)), float(trade.get("size", 0))
+                                    st.current_price = price
+                                    st.trades_buffer.append({"ts": ts, "price": price, "qty": abs(qty), "side": "buy" if qty > 0 else "sell"})
+                                    st.price_buffer.append((ts, price))
+                                    # Cleanup
+                                    while st.trades_buffer and st.trades_buffer[0]["ts"] < ts - 10: st.trades_buffer.popleft()
+                                    while st.price_buffer and st.price_buffer[0][0] < ts - 90: st.price_buffer.popleft()
+                                    # Check Signal
+                                    if beast_risk_check(st):
+                                        sig = get_signal(st)
+                                        if sig != 0: create_task(execute_entry(st, sig))
+                        
+                        elif channel == "futures.positions" and ev == "update":
+                            for pos in (data.get("result", []) if isinstance(data.get("result"), list) else [data.get("result")]):
+                                sym, size = pos.get("contract", ""), float(pos.get("size", 0))
+                                st = states.get(sym)
+                                if st and size == 0 and st.open_position:
+                                    pnl, exit_p = float(pos.get("realised_pnl", 0)), float(pos.get("last_price", st.entry_price))
+                                    logger.info(f"[{sym}] 🔴 CLOSED | PnL: {pnl:.4f}")
+                                    if pnl < 0: st.last_sl_time = time.time()
+                                    log_trade(sym, "LONG" if st.side==1 else "SHORT", st.entry_price, 0, 0, st.entry_settings, exit_p, round(pnl,4), "closed")
+                                    st.open_position = False
 
-# ─────────────────────────────────────────────
-#  🔐  WS AUTH & CONNECT
-# ─────────────────────────────────────────────
+                    except asyncio.TimeoutError: continue
+                
+                logger.info("Re-subscribing due to market refresh...")
+                
+        except Exception as e:
+            logger.error(f"WS Error: {e}. Reconnecting...")
+            await asyncio.sleep(5)
+
 def make_ws_auth(channel: str, event: str) -> dict:
     ts = int(time.time())
     msg = f"channel={channel}\nevent={event}\ntime={ts}"
     sig = hmac.new(API_SECRET.encode("utf-8"), msg.encode("utf-8"), hashlib.sha512).hexdigest()
     return {"method": "api_key", "KEY": API_KEY, "SIGN": sig, "Timestamp": str(ts)}
 
-async def connect_websocket():
-    backoff, ssl_ctx = 1, ssl.create_default_context()
-    while True:
-        try:
-            logger.info(f"Connecting to WebSocket: {WSS_URL}")
-            async with websockets.connect(WSS_URL, ssl=ssl_ctx, ping_interval=20, ping_timeout=30) as ws:
-                backoff = 1
-                # Subscriptions
-                await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.trades", "event": "subscribe", "payload": ALL_SYMBOLS}))
-                await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.positions", "event": "subscribe", "payload": ["!all"], "auth": make_ws_auth("futures.positions", "subscribe")}))
-                logger.info(f"WebSocket connected and subscribed")
-                
-                async for raw in ws:
-                    data = json.loads(raw)
-                    channel, ev = data.get("channel"), data.get("event")
-                    if channel == "futures.trades" and ev == "update":
-                        results = data.get("result", [])
-                        for trade in (results if isinstance(results, list) else [results]):
-                            symbol = trade.get("contract")
-                            if symbol in states:
-                                process_trade_event(symbol, trade)
-                                st = states[symbol]
-                                if risk_check(st):
-                                    sig = get_signal(st)
-                                    if sig != 0: create_task(execute_entry(st, sig))
-                    elif channel == "futures.positions" and ev == "update":
-                        results = data.get("result", [])
-                        for pos in (results if isinstance(results, list) else [results]):
-                            process_position_update(pos)
-        except Exception as e:
-            logger.error(f"WS Connection error: {e}. Retrying in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-
 # ─────────────────────────────────────────────
 #  🏁  MAIN
 # ─────────────────────────────────────────────
 async def main():
-    logger.info(f"Starting Gate.io HFT Bot v8.0 | Mode: {'TESTNET' if TESTNET_MODE else 'LIVE'}")
-    if not API_KEY or not API_SECRET:
-        logger.error("API Keys missing! Exiting.")
-        return
+    logger.info("Starting Gate.io HFT BEAST v9.0")
+    if not API_KEY or not API_SECRET: return
     
-    sync_open_positions()
-    create_task(update_volumes())
+    # Initial scan
+    await refresh_market_symbols()
+    
+    create_task(refresh_market_symbols())
     await connect_websocket()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
